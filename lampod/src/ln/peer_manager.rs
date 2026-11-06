@@ -47,7 +47,11 @@ pub type SimpleArcPeerManager<M, T, L> = PeerManager<
     Arc<L>,
     IgnoringMessageHandler,
     Arc<dyn LampoSigner>,
-    IgnoringMessageHandler,
+    // ChainMonitor implements SendOnlyMessageHandler. With `cfg(peer_storage)`
+    // it queues our encrypted channel-monitor backup; PeerManager drains that
+    // queue. IgnoringMessageHandler would drop every `peer_storage` we owe a
+    // channel peer (BOLT 1).
+    Arc<M>,
 >;
 
 type InnerLampoPeerManager =
@@ -186,7 +190,12 @@ impl LampoPeerManager {
             onion_message_handler: onion_messenger.clone(),
             route_handler: gossip_sync,
             custom_message_handler: IgnoringMessageHandler {},
-            send_only_message_handler: IgnoringMessageHandler {},
+            // Same ChainMonitor the channel manager watches. LDK encrypts our
+            // monitor backup with `NodeSigner::get_peer_storage_key` and emits
+            // `peer_storage` from this handler on every `best_block_updated`.
+            // The esplora poll skips that call when the tip hash and height
+            // are unchanged, so a repeat poll does not send another blob.
+            send_only_message_handler: channel_manager.chain_monitor(),
         };
 
         let peer_manager = InnerLampoPeerManager::new(
@@ -504,11 +513,22 @@ impl LampoPeerManager {
         Ok(())
     }
 
-    pub fn is_connected_with(&self, peer_id: NodeId) -> bool {
+    /// Whether `peer_id` has a live LDK peer entry.
+    ///
+    /// Returns an error when this manager was never `init`ed. Callers on an
+    /// RPC path must use this, not [`Self::is_connected_with`]: the panic
+    /// there is reachable from `fundchannel` if init was skipped, and it
+    /// kills the worker instead of returning an RPC error.
+    pub fn try_is_connected_with(&self, peer_id: NodeId) -> error::Result<bool> {
         let Some(ref manager) = self.peer_manager else {
-            panic!("at this point the peer manager should be known");
+            error::bail!("peer manager is not initialized");
         };
-        manager.peer_by_node_id(&peer_id).is_some()
+        Ok(manager.peer_by_node_id(&peer_id).is_some())
+    }
+
+    pub fn is_connected_with(&self, peer_id: NodeId) -> bool {
+        self.try_is_connected_with(peer_id)
+            .expect("at this point the peer manager should be known")
     }
 
     pub async fn connect(&self, node_id: NodeId, host: SocketAddr) -> error::Result<()> {
@@ -713,7 +733,50 @@ fn write_peers(path: &std::path::Path, peers: &std::collections::HashMap<String,
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use lampo_common::conf::LampoConf;
+    use lampo_common::types::NodeId;
+
     use super::p2p_bind_addr;
+    use super::LampoPeerManager;
+    use crate::utils::logger::LampoLogger;
+
+    /// A fixed, valid compressed pubkey. The id is never looked up: the
+    /// uninit path returns before `peer_by_node_id`.
+    fn some_node_id() -> NodeId {
+        NodeId::from_str("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619")
+            .expect("test pubkey")
+    }
+
+    /// Proof that `fundchannel`'s connection check must not use the panicking
+    /// getter. `LampoPeerManager::new` leaves the inner LDK manager unset,
+    /// which is the state an RPC sees if `init_peer_manager` never ran.
+    /// `is_connected_with` unwinds. `try_is_connected_with` does not.
+    #[test]
+    fn uninit_peer_manager_is_not_a_panic_on_the_rpc_path() {
+        let manager = LampoPeerManager::new(&LampoConf::default(), Arc::new(LampoLogger));
+        let peer = some_node_id();
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| manager.is_connected_with(peer)));
+        assert!(
+            panicked.is_err(),
+            "is_connected_with still panics when init never ran; fundchannel must not call it"
+        );
+
+        let reached = manager.try_is_connected_with(peer);
+        assert!(
+            reached.is_err(),
+            "the uninit path is reachable and must be an error, not a panic"
+        );
+        let message = reached.unwrap_err().to_string();
+        assert!(
+            message.contains("not initialized"),
+            "unexpected error: {message}"
+        );
+    }
 
     #[test]
     fn unset_announce_addr_does_not_bind() {

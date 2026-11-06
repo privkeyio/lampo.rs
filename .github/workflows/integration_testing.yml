@@ -8,13 +8,97 @@ on:
   schedule:
     - cron: '30 1 1,15 * *'
 
+# One Rust build. Every later job runs a binary from that artifact.
+# `unit` is the workspace tests that do not need a chain. The matrix
+# is `make integration` against Core and rbitcoin.
 jobs:
-  test:
+  build:
+    name: Build test binaries
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v2
-      - name: lampo integration testing
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: System packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config zlib1g-dev
+
+      - name: Build test binaries
+        run: ./tools/test-bins.sh build
+
+      - name: Upload test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: lampo-test-bins
+          path: target/ci-bins/
+          retention-days: 1
+
+  unit:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: lampo-test-bins
+          path: target/ci-bins
+
+      - name: Run unit tests
         run: |
-          docker build -f docker/Dockerfile -t lampo-ci-ubuntu .
-          docker run lampo-ci-ubuntu
+          chmod +x tools/test-bins.sh target/ci-bins/*
+          ./tools/test-bins.sh run-unit
+
+  test:
+    name: test (${{ matrix.chain }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        chain: [core, rbitcoin]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: lampo-test-bins
+          path: target/ci-bins
+
+      - name: Install chain backend
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl ca-certificates
+          if [ "${{ matrix.chain }}" = "core" ]; then
+            wget -q https://bitcoincore.org/bin/bitcoin-core-25.1/bitcoin-25.1-x86_64-linux-gnu.tar.gz -O /tmp/bitcoin.tar.gz
+            tar -xzf /tmp/bitcoin.tar.gz -C /tmp
+            sudo install -m 0755 /tmp/bitcoin-25.1/bin/bitcoind /usr/local/bin/bitcoind
+            bitcoind -version
+          else
+            wget -q https://github.com/reardencode/rbitcoin/releases/download/v0.8.0/rbitcoin-node-x86_64-linux -O /tmp/rbitcoin-node
+            wget -q https://github.com/reardencode/rbitcoin/releases/download/v0.8.0/SHA256SUMS.linux-musl -O /tmp/SHA256SUMS.linux-musl
+            grep ' rbitcoin-node$' /tmp/SHA256SUMS.linux-musl | (cd /tmp && sha256sum -c -)
+            sudo install -m 0755 /tmp/rbitcoin-node /usr/local/bin/rbitcoin-node
+            rbitcoin-node --version
+          fi
+
+      - name: Run integration tests
+        env:
+          LAMPO_CHAIN_BACKEND: ${{ matrix.chain }}
+        run: |
+          chmod +x tools/test-bins.sh target/ci-bins/*
+          ./tools/test-bins.sh run-integration
