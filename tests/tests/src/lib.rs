@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod cln_interop;
+#[cfg(test)]
 pub mod lampo_lnd_tests;
 #[cfg(test)]
 pub mod lampo_tests;
