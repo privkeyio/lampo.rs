@@ -980,11 +980,11 @@ mod tests {
 
     use lampo_common::async_trait;
     use lampo_common::bitcoin::absolute::Height;
-    use lampo_common::bitcoin::block::Header as BlockHeader;
-    use lampo_common::bitcoin::block::{TxMerkleNode, Version};
+    use lampo_common::bitcoin::constants::genesis_block;
     use lampo_common::bitcoin::hashes::Hash;
-    use lampo_common::bitcoin::pow::CompactTarget;
-    use lampo_common::bitcoin::{Amount, Block, BlockHash, FeeRate, ScriptBuf, Transaction};
+    use lampo_common::bitcoin::{
+        Amount, Block, BlockHash, FeeRate, Network, ScriptBuf, Transaction,
+    };
     use lampo_common::chainsync::{ChainSyncCoordinator, SyncState};
     use lampo_common::conf::LampoConf;
     use lampo_common::error;
@@ -1140,14 +1140,7 @@ mod tests {
 
     fn dummy_block() -> Block {
         Block {
-            header: BlockHeader {
-                version: Version::default(),
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
-                time: 0,
-                bits: CompactTarget::from_consensus(0),
-                nonce: 0,
-            },
+            header: genesis_block(Network::Regtest).header,
             txdata: Vec::new(),
         }
     }
