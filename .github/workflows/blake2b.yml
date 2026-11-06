@@ -1,0 +1,146 @@
+name: BLAKE2b
+
+on:
+  push:
+    branches: [blake2b]
+  pull_request:
+    branches: [blake2b]
+
+# Runs the suite on a chain that enforces BLAKE2b consensus: the pinned
+# Bitcoin Knots release with the BLAKE2b deployment active from block 1, and
+# Core Lightning from the matching privkeyio release for interop.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build test binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: System packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config zlib1g-dev
+
+      - name: Build test binaries
+        run: ./tools/test-bins.sh build
+
+      - name: Upload test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: lampo-test-bins
+          path: target/ci-bins/
+          retention-days: 1
+
+  unit:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: lampo-test-bins
+          path: target/ci-bins
+
+      - name: Run unit tests
+        run: |
+          chmod +x tools/test-bins.sh target/ci-bins/*
+          ./tools/test-bins.sh run-unit
+
+  integration:
+    name: Integration and Core Lightning interop
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      KNOTS_VERSION: 29.4.1.knots20260508
+      KNOTS_SHA256: 0d0b435ae67dd38d150c048a388be821ad0ca8b46d6dcace5c34d4ba2977801b
+      CLN_VERSION: v26.06.10-blake2b.1
+      CLN_SHA256: 06f915f0a3fd0e958c3efeac99117daf58af641f07f4129bc8676073b1ab185b
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: lampo-test-bins
+          path: target/ci-bins
+
+      - name: Install Bitcoin Knots with BLAKE2b active
+        run: |
+          set -euo pipefail
+          file="bitcoin-${KNOTS_VERSION}-x86_64-linux-gnu.tar.gz"
+          wget -q "https://github.com/bitcoinknots/bitcoin/releases/download/v${KNOTS_VERSION}/${file}" -O "/tmp/${file}"
+          echo "${KNOTS_SHA256}  /tmp/${file}" | sha256sum -c -
+          tar -xzf "/tmp/${file}" -C /tmp
+          sudo install -D -m 0755 "/tmp/bitcoin-${KNOTS_VERSION}/bin/bitcoind" /usr/local/libexec/knots-bitcoind
+          sudo install -m 0755 "/tmp/bitcoin-${KNOTS_VERSION}/bin/bitcoin-cli" /usr/local/bin/bitcoin-cli
+          printf '#!/bin/sh\nexec /usr/local/libexec/knots-bitcoind -testactivationheight=blake2b@1 -rejectparasites=0 "$@"\n' > /tmp/bitcoind
+          sudo install -m 0755 /tmp/bitcoind /usr/local/bin/bitcoind
+          bitcoind -version | grep "${KNOTS_VERSION}"
+
+      - name: Install Core Lightning
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsodium23 libsqlite3-0 libpq5
+          file="clightning-${CLN_VERSION}-Ubuntu-24.04-amd64.tar.xz"
+          wget -q "https://github.com/privkeyio/lightning/releases/download/${CLN_VERSION}/${file}" -O "/tmp/${file}"
+          echo "${CLN_SHA256}  /tmp/${file}" | sha256sum -c -
+          sudo mkdir -p /opt/cln
+          sudo tar -xJf "/tmp/${file}" -C /opt/cln
+          /opt/cln/usr/bin/lightningd --version
+
+      - name: Run integration tests
+        timeout-minutes: 20
+        env:
+          BITCOIND_EXE: /usr/local/bin/bitcoind
+          LAMPO_CHAIN_BACKEND: core
+        run: |
+          set -euo pipefail
+          chmod +x target/ci-bins/*
+          export LAMPO_BITCOIND="$PWD/target/ci-bins/lampo-bitcoind"
+          bin="target/ci-bins/$(awk -F'\t' '$1 == "tests" { print $3 }' target/ci-bins/manifest.tsv)"
+          # Splices are refused on BLAKE2b channels. The interop test checks the refusal.
+          "$bin" --skip lampo_tests::splice_in_out_and_fee_bump_between_two_nodes
+
+      - name: Run Core Lightning interop
+        timeout-minutes: 10
+        env:
+          BITCOIND_EXE: /usr/local/bin/bitcoind
+          LAMPO_CHAIN_BACKEND: core
+          INTEROP_LIGHTNINGD: /opt/cln/usr/bin/lightningd
+          INTEROP_LIGHTNING_CLI: /opt/cln/usr/bin/lightning-cli
+          INTEROP_BITCOIN_CLI: /usr/local/bin/bitcoin-cli
+        run: |
+          set -euo pipefail
+          export LAMPO_BITCOIND="$PWD/target/ci-bins/lampo-bitcoind"
+          export INTEROP_DIR="$RUNNER_TEMP/interop"
+          mkdir -p "$INTEROP_DIR"
+          bin="target/ci-bins/$(awk -F'\t' '$1 == "tests" { print $3 }' target/ci-bins/manifest.tsv)"
+          "$bin" --ignored --exact cln_interop::cln_interop --nocapture
+
+      - name: Upload Core Lightning logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cln-interop-logs
+          path: |
+            ${{ runner.temp }}/interop/*/log
+            ${{ runner.temp }}/interop/*/stderr
+          if-no-files-found: ignore
+          retention-days: 7
