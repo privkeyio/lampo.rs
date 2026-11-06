@@ -30,6 +30,16 @@ default-members = [
 ]
 resolver = "2"
 
+# `peer_storage` is an LDK rustc cfg, not a Cargo feature. Listing it here
+# lets `cfg!(peer_storage)` in `lampod/build.rs` compile without an
+# `unexpected_cfgs` warning. A missing cfg fails that build script.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(peer_storage)',
+] }
+
+
+
 # LDK 0.3 is published to crates.io as a pre-release, so the requirement has to
 # spell out `0.3.0-beta1`: a bare `0.3` does not match pre-release versions.
 # Bump every lightning* crate together so the stack stays on one version
